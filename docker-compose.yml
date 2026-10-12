@@ -1,0 +1,260 @@
+version: '3.9'
+
+# Two separated networks: app and observability
+networks:
+  app:
+    driver: bridge
+    name: minicart-app
+
+  observability:
+    driver: bridge
+    name: minicart-observability
+
+# ============================================================================
+# APPLICATION SERVICES (app network)
+# ============================================================================
+
+services:
+  # ============================================================================
+  # MICROSERVICES (in dependency order: Catalog → Cart → Order)
+  # ============================================================================
+
+  # CatalogService - Product catalog (no upstream dependencies)
+  catalog-service:
+    build:
+      context: ./apps/services/CatalogService
+      dockerfile: Dockerfile
+    container_name: minicart-catalog
+    ports:
+      - "5001:5001"
+    networks:
+      - app
+      - observability
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      SERVICE_NAME: catalog-service
+      ASPNETCORE_URLS: http://0.0.0.0:5001
+    depends_on:
+      - otel-collector
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # CartService - Shopping cart (calls CatalogService)
+  cart-service:
+    build:
+      context: ./apps/services/CartService
+      dockerfile: Dockerfile
+    container_name: minicart-cart
+    ports:
+      - "5002:5002"
+    networks:
+      - app
+      - observability
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      SERVICE_NAME: cart-service
+      ASPNETCORE_URLS: http://0.0.0.0:5002
+      CATALOG_SERVICE_URL: http://catalog-service:5001
+    depends_on:
+      - catalog-service
+      - otel-collector
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # OrderService - Order processing (calls CartService)
+  order-service:
+    build:
+      context: ./apps/services/OrderService
+      dockerfile: Dockerfile
+    container_name: minicart-order
+    ports:
+      - "5003:5003"
+    networks:
+      - app
+      - observability
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      SERVICE_NAME: order-service
+      ASPNETCORE_URLS: http://0.0.0.0:5003
+      CART_SERVICE_URL: http://cart-service:5002
+    depends_on:
+      - cart-service
+      - otel-collector
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Web Frontend (Next.js) - will be added after services are running
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    container_name: minicart-web
+    ports:
+      - "3001:3000"
+    networks:
+      - app
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:3001/api
+      CATALOG_SERVICE_URL: http://catalog-service:5001
+      CART_SERVICE_URL: http://cart-service:5002
+      ORDER_SERVICE_URL: http://order-service:5003
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      SERVICE_NAME: web
+    depends_on:
+      - catalog-service
+      - cart-service
+      - order-service
+      - otel-collector
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    volumes:
+      - ./apps/web:/app
+      - /app/node_modules
+      - /app/.next
+
+  # ========================================================================
+  # OBSERVABILITY SERVICES (observability network + bridge to app)
+  # ========================================================================
+
+  # OpenTelemetry Collector (on both networks)
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: minicart-otel-collector
+    command:
+      - "--config=/etc/otel-collector-config.yml"
+    ports:
+      - "4317:4317"  # OTLP gRPC receiver
+      - "4318:4318"  # OTLP HTTP receiver
+      - "8888:8888"  # Prometheus metrics exposed by collector
+      - "8889:8889"  # Prometheus exporter
+    networks:
+      - app
+      - observability
+    volumes:
+      - ./observability/otel-collector/config.yml:/etc/otel-collector-config.yml
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    environment:
+      GOGC: 80
+
+  # Prometheus (metrics storage)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: minicart-prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - observability
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-storage:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    environment:
+      TZ: UTC
+
+  # Loki (log aggregation)
+  loki:
+    image: grafana/loki:latest
+    container_name: minicart-loki
+    ports:
+      - "3100:3100"
+    networks:
+      - observability
+    volumes:
+      - ./observability/loki/loki-config.yml:/etc/loki/local-config.yml
+      - loki-storage:/loki
+    command: -config.file=/etc/loki/local-config.yml
+    environment:
+      TZ: UTC
+
+  # Tempo (trace storage)
+  tempo:
+    image: grafana/tempo:latest
+    container_name: minicart-tempo
+    ports:
+      - "3200:3200"
+    networks:
+      - observability
+    volumes:
+      - ./observability/tempo/tempo-config.yml:/etc/tempo.yml
+      - tempo-storage:/var/tempo
+    command:
+      - "-config.file=/etc/tempo.yml"
+    environment:
+      TZ: UTC
+
+  # Grafana (dashboards and visualization)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: minicart-grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - observability
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: grafana-piechart-panel
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      TZ: UTC
+    volumes:
+      - ./observability/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      - ./observability/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - grafana-storage:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+
+  # Promtail (log scraper for Docker container logs)
+  promtail:
+    image: grafana/promtail:latest
+    container_name: minicart-promtail
+    ports:
+      - "9080:9080"
+    networks:
+      - observability
+    volumes:
+      - ./observability/promtail/config.yml:/etc/promtail/config.yml
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    environment:
+      TZ: UTC
+
+# ============================================================================
+# NAMED VOLUMES (persist data across container restarts)
+# ============================================================================
+
+volumes:
+  prometheus-storage:
+    driver: local
+  loki-storage:
+    driver: local
+  tempo-storage:
+    driver: local
+  grafana-storage:
+    driver: local

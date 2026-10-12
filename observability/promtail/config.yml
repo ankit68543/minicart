@@ -1,0 +1,28 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # Keep only minicart services
+      - source_labels: ['__meta_docker_container_name']
+        regex: 'minicart-.+'
+        action: keep
+      # Extract service name from container name (minicart-<service> -> service)
+      - source_labels: ['__meta_docker_container_name']
+        regex: 'minicart-(.+)'
+        target_label: service_name
+        replacement: '$1'
+      # Set job label to container name
+      - source_labels: ['__meta_docker_container_name']
+        target_label: job

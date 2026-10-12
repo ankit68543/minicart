@@ -1,0 +1,87 @@
+// ============================================================================
+// GRAFANA ALLOY CONFIGURATION - Simplified OTLP Passthrough
+// ============================================================================
+
+// Global logging configuration
+logging {
+  level  = "info"
+}
+
+// ============================================================================
+// OTLP RECEIVER - Accept telemetry from services
+// ============================================================================
+
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    traces  = [otelcol.processor.batch.traces.input]
+    metrics = [otelcol.processor.batch.metrics.input]
+    logs    = [otelcol.processor.batch.logs.input]
+  }
+}
+
+// ============================================================================
+// PROCESSORS - Batch for efficiency
+// ============================================================================
+
+otelcol.processor.batch "traces" {
+  send_batch_size = 1024
+  timeout         = "10s"
+
+  output {
+    traces = [otelcol.exporter.otlp.tempo.input]
+  }
+}
+
+otelcol.processor.batch "metrics" {
+  send_batch_size = 1024
+  timeout         = "10s"
+
+  output {
+    metrics = [prometheus.exporter.otlp.metrics.input]
+  }
+}
+
+otelcol.processor.batch "logs" {
+  send_batch_size = 1024
+  timeout         = "10s"
+
+  output {
+    logs = [loki.process.logs.input]
+  }
+}
+
+// ============================================================================
+// EXPORTERS
+// ============================================================================
+
+// Export traces to Tempo
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "tempo:4317"
+    tls {
+      insecure = true
+    }
+  }
+}
+
+// Export metrics via Prometheus remote write (alternative: expose on 8889)
+prometheus.exporter.otlp "metrics" {
+}
+
+// Process logs and send to Loki via HTTP
+loki.process "logs" {
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
